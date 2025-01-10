@@ -98,7 +98,7 @@ func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, err
 	if f.repo == nil {
 		repo, err := f.baseRepoFn()
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not determine base repo: %w", err)
+			return nil, nil, err
 		}
 		f.repo = repo
 	}
@@ -139,7 +139,7 @@ func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, err
 	fields := set.NewStringSet()
 	fields.AddValues(opts.Fields)
 	numberFieldOnly := fields.Len() == 1 && fields.Contains("number")
-	fields.Add("id") // for additional preload queries below
+	fields.AddValues([]string{"id", "number"}) // for additional preload queries below
 
 	if fields.Contains("isInMergeQueue") || fields.Contains("isMergeQueueEnabled") {
 		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
@@ -152,6 +152,12 @@ func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, err
 			fields.Remove("isInMergeQueue")
 			fields.Remove("isMergeQueueEnabled")
 		}
+	}
+
+	var getProjectItems bool
+	if fields.Contains("projectItems") {
+		getProjectItems = true
+		fields.Remove("projectItems")
 	}
 
 	var pr *api.PullRequest
@@ -182,6 +188,16 @@ func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, err
 	if fields.Contains("statusCheckRollup") {
 		g.Go(func() error {
 			return preloadPrChecks(httpClient, f.repo, pr)
+		})
+	}
+	if getProjectItems {
+		g.Go(func() error {
+			apiClient := api.NewClientFromHTTP(httpClient)
+			err := api.ProjectsV2ItemsForPullRequest(apiClient, f.repo, pr)
+			if err != nil && !api.ProjectsV2IgnorableError(err) {
+				return err
+			}
+			return nil
 		})
 	}
 
@@ -230,27 +246,36 @@ func (f *finder) parseCurrentBranch() (string, int, error) {
 		return "", prNumber, nil
 	}
 
-	var branchOwner string
+	var gitRemoteRepo ghrepo.Interface
 	if branchConfig.RemoteURL != nil {
 		// the branch merges from a remote specified by URL
 		if r, err := ghrepo.FromURL(branchConfig.RemoteURL); err == nil {
-			branchOwner = r.RepoOwner()
+			gitRemoteRepo = r
 		}
 	} else if branchConfig.RemoteName != "" {
 		// the branch merges from a remote specified by name
 		rem, _ := f.remotesFn()
 		if r, err := rem.FindByName(branchConfig.RemoteName); err == nil {
-			branchOwner = r.RepoOwner()
+			gitRemoteRepo = r
 		}
 	}
 
-	if branchOwner != "" {
+	if gitRemoteRepo != nil {
 		if strings.HasPrefix(branchConfig.MergeRef, "refs/heads/") {
 			prHeadRef = strings.TrimPrefix(branchConfig.MergeRef, "refs/heads/")
 		}
 		// prepend `OWNER:` if this branch is pushed to a fork
-		if !strings.EqualFold(branchOwner, f.repo.RepoOwner()) {
-			prHeadRef = fmt.Sprintf("%s:%s", branchOwner, prHeadRef)
+		// This is determined by:
+		//  - The repo having a different owner
+		//  - The repo having the same owner but a different name (private org fork)
+		// I suspect that the implementation of the second case may be broken in the face
+		// of a repo rename, where the remote hasn't been updated locally. This is a
+		// frequent issue in commands that use SmartBaseRepoFunc. It's not any worse than not
+		// supporting this case at all though.
+		sameOwner := strings.EqualFold(gitRemoteRepo.RepoOwner(), f.repo.RepoOwner())
+		sameOwnerDifferentRepoName := sameOwner && !strings.EqualFold(gitRemoteRepo.RepoName(), f.repo.RepoName())
+		if !sameOwner || sameOwnerDifferentRepoName {
+			prHeadRef = fmt.Sprintf("%s:%s", gitRemoteRepo.RepoOwner(), prHeadRef)
 		}
 	}
 
@@ -339,7 +364,13 @@ func findForBranch(httpClient *http.Client, repo ghrepo.Interface, baseBranch, h
 	})
 
 	for _, pr := range prs {
-		if pr.HeadLabel() == headBranch && (baseBranch == "" || pr.BaseRefName == baseBranch) && (pr.State == "OPEN" || resp.Repository.DefaultBranchRef.Name != headBranch) {
+		headBranchMatches := pr.HeadLabel() == headBranch
+		baseBranchEmptyOrMatches := baseBranch == "" || pr.BaseRefName == baseBranch
+		// When the head is the default branch, it doesn't really make sense to show merged or closed PRs.
+		// https://github.com/cli/cli/issues/4263
+		isNotClosedOrMergedWhenHeadIsDefault := pr.State == "OPEN" || resp.Repository.DefaultBranchRef.Name != headBranch
+
+		if headBranchMatches && baseBranchEmptyOrMatches && isNotClosedOrMergedWhenHeadIsDefault {
 			return &pr, nil
 		}
 	}
@@ -449,7 +480,7 @@ func preloadPrChecks(client *http.Client, repo ghrepo.Interface, pr *api.PullReq
 				%s
 			}
 		}
-	}`, api.StatusCheckRollupGraphQL("$endCursor"))
+	}`, api.StatusCheckRollupGraphQLWithoutCountByState("$endCursor"))
 
 	variables := map[string]interface{}{
 		"id": pr.ID,
